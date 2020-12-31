@@ -44,17 +44,42 @@ func (m *MySqlStruct) SelectRows(query string, args ...interface{}) (*sql.Rows, 
 }
 
 /*
-查询,传入一个切片的指针，结果被返回到该切片中；
-原始SQL:
-  select id,name,age from calss where sex='男' and age>12;
-Select:
+查询,传入一个指针，结果被返回到该指针对应的值中，该指针可以是以下三种数据类型，
+分别为多行(切片)，单行(结构体)，单个基础类型值(如int,string,float64等）
+对于前两者每个字段必须以大写字母开头，对于单个基础类型，则无此限制。
+
+以结构体student为例，
 	type student struct {
 		Id   int
 		Name string
 		Age  int
 	}
-	var result []student
-	err = Select(&result, `select id,name,age from calss where sex=? and age>?`, "男", 12)
+多行：
+    注意，此处同时支持两种切片，分别是复杂切片(每行为一个结构体)与简单切片(每一行中只有一个字段)，如下：
+    1)复杂切片
+		原始SQL:
+		select id,name,age from calss where sex='男' and age>12;
+		Select:
+			var result []student
+			err = Select(&result, `select id,name,age from calss where sex=? and age>?`, "男", 12)
+	2)简单切片
+	原始SQL:
+		select  name from calss where sex='男' and age>12;
+		Select:
+			var result []string
+			err = Select(&result, `select id,name,age from calss where sex=? and age>?`, "男", 12)
+单行：
+		原始SQL:
+		select id,name,age from calss where sex='男' and age>12 limit 1;
+		Select:
+			var result student
+			err = Select(&result, `select id,name,age from calss where sex=? and age>?  limit 1`, "男", 12)
+单值：
+		原始SQL:
+		select  name from calss where sex='男' and age>12 limit 1;
+		Select:
+			var result string
+			err = Select(&result, `select  name from calss where sex='男' and age>12 limit 1`, "男", 12)
 */
 func (m *MySqlStruct) Select(intoResultPtr interface{}, query string, args ...interface{}) error {
 	//先判断传入的数据是否是指针,now the value shoule be: *[]interface{},top kind is a ptr
@@ -62,11 +87,45 @@ func (m *MySqlStruct) Select(intoResultPtr interface{}, query string, args ...in
 	if refValue.Kind() != reflect.Ptr { //&& refValue.IsNil()
 		return fmt.Errorf("the first argument resultPtr must be a pointer,not a value.")
 	}
-	//再判断下一级是否是切片,now dirValue shoule be: []interface{},top kind is a slice
+	//再判断下一级是什么数据
 	dirValue := reflect.Indirect(refValue)
-	if dirValue.Kind() != reflect.Slice {
-		return fmt.Errorf("the first argument resultPtr must be a slice.")
+	//同时支持单行，多行，以及单个基础数据类型的处理
+	switch dirValue.Kind() {
+	case reflect.Slice:
+		return m.selectInToRows(intoResultPtr, query, args...)
+	case reflect.Struct:
+		return m.selectInToRow(intoResultPtr, query, args...)
+	case reflect.Bool,
+		reflect.Int,
+		reflect.Int8,
+		reflect.Int16,
+		reflect.Int32,
+		reflect.Int64,
+		reflect.Uint,
+		reflect.Uint8,
+		reflect.Uint16,
+		reflect.Uint32,
+		reflect.Uint64,
+		reflect.Float32,
+		reflect.Float64,
+		reflect.String:
+		return m.selectInToBaseType(intoResultPtr, query, args...)
+	default:
+		return fmt.Errorf("the first argument resultPtr must be a slice or struct or baseType such as Bool,In,Int8,Int16,Int32,Int64,Uint,Uint8,Uint16,Uint32,Uint64,Float32,Float64,String")
 	}
+}
+
+/*
+	原始SQL:
+	select id,name,age from calss where sex='男' and age>12;
+	Select:
+		var result []student
+		err = Select(&result, `select id,name,age from calss where sex=? and age>?`, "男", 12)
+*/
+func (m *MySqlStruct) selectInToRows(intoResultPtr interface{}, query string, args ...interface{}) error {
+	refValue := reflect.ValueOf(intoResultPtr)
+	dirValue := reflect.Indirect(refValue)
+
 	//判断切片是否为空
 	if l := dirValue.Len(); l != 0 {
 		return fmt.Errorf(fmt.Sprintf("the first argument resultPtr has %v records,and it's must be empty.", l))
@@ -147,6 +206,90 @@ func (m *MySqlStruct) Select(intoResultPtr interface{}, query string, args ...in
 		arrayObject = reflect.Append(arrayObject, structObject.Elem())
 	}
 	dirValue.Set(arrayObject)
+	return nil
+}
+
+/*
+	原始SQL:
+	select id,name,age from calss where sex='男' and age>12 limit 1;
+	Select:
+		var result student
+		err = Select(&result, `select id,name,age from calss where sex=? and age>?  limit 1`, "男", 12)
+*/
+func (m *MySqlStruct) selectInToRow(intoResultPtr interface{}, query string, args ...interface{}) error {
+	structObject := reflect.ValueOf(intoResultPtr)
+	structElem := reflect.Indirect(structObject)
+	//判断结构体中字段的数字母是否是大写，因为反射只在大写情况才起作用
+	itemNum := structElem.NumField()
+	for i := 0; i < itemNum; i++ {
+		if !structElem.Field(i).CanSet() {
+			fieldName := structElem.Type().Field(i).Name
+			intoResultPtrName := structObject.Type().Elem().Name()
+			return fmt.Errorf(fmt.Sprintf("the field name %v.%v should be %v.%v,because the first letter is capitalized can be exported in reflect.",
+				intoResultPtrName, fieldName, intoResultPtrName, strings.Title(fieldName)))
+		}
+	}
+	rows, err := m.SelectRows(query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	//判断两方元素数量是否一样多
+	if itemNum != len(columns) {
+		return fmt.Errorf(fmt.Sprintf("intoResultPtr fileds num %v doesn't mutch columns num %v from database.", itemNum, len(columns)))
+	}
+	num := 0
+	for rows.Next() { //rows.NextResultSet()
+		oneRowPtr := make([]interface{}, itemNum)
+		//实例化oneRowPtr
+		i := 0 //出错时，要取列名
+		for i = 0; i < itemNum; i++ {
+			oneRowPtr[i] = structElem.Field(i).Addr().Interface()
+		}
+		//Scan到oneRowPtr，也就意味着Scan到structElem
+		err = rows.Scan(oneRowPtr...)
+		if err != nil {
+			fieldName := structElem.Type().Field(i - 1).Name
+			columnName := columns[i-1]
+			return fmt.Errorf(fmt.Sprintf("intoResultPtr %vth fileds %v doesn't mutch database %vth column %v or %v.", i, fieldName, i, columnName, err))
+		}
+		//结果集必须只有一行
+		if num == 2 {
+			return fmt.Errorf(fmt.Sprintf("result fileds must be 1 row."))
+		}
+	}
+	return nil
+}
+
+/*
+	原始SQL:
+	select  name from calss where sex='男' and age>12 limit 1;
+	Select:
+		var result string
+		err = Select(&result, `select  name from calss where sex='男' and age>12 limit 1`, "男", 12)
+*/
+func (m *MySqlStruct) selectInToBaseType(intoResultPtr interface{}, query string, args ...interface{}) error {
+	rows, err := m.SelectRows(query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	num := 0
+	for rows.Next() { //rows.NextResultSet()
+		err = rows.Scan(intoResultPtr)
+		if err != nil {
+			return err
+		}
+		num++
+		//结果集必须只有一行
+		if num == 2 {
+			return fmt.Errorf(fmt.Sprintf("result fileds must be 1 row."))
+		}
+	}
 	return nil
 }
 
